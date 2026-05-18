@@ -1,0 +1,215 @@
+---
+title: "Movement Analysis"
+author: "Nicola Noger"
+format: html
+editor: visual
+engine: knitr
+---
+
+## Solution for Movement Analysis
+
+In this document, I solve the tasks for Movement Analysis of the course Spatiotemporal Datascience
+
+
+```{r}
+library(sf)
+library(dplyr)
+library(caret)
+
+# ==========================================
+# 1. LOAD DATASETS
+# ==========================================
+
+# Load OpenStreetMap context layers
+gpkg_osm <- "data/movement-II/osm.gpkg"
+highway <- read_sf(gpkg_osm, "highway")
+railway <- read_sf(gpkg_osm, "railway")
+
+# Load the full trajectory dataset from previous week
+tracks <- read_sf("data/movement-I/tracks_1.gpkg", layer = "training")
+```
+
+
+
+# ==========================================
+# 2. MOVEMENT FEATURE ENGINEERING
+# ==========================================
+
+```{r}
+## Prepare numeric coordinates for efficient interpolation
+coords <- st_coordinates(tracks)
+tracks$X <- coords[,1]
+tracks$Y <- coords[,2]
+
+# Calculate baseline movement parameters based on spatial coordinates and time
+tracks_features <- tracks |>
+  arrange(user_id, datetime) |>
+  group_by(user_id) |>
+  mutate(
+    lead_X = lead(X),
+    lead_Y = lead(Y),
+    time_diff = as.numeric(difftime(lead(datetime), datetime, units = "secs")),
+    # Euclidean distance in projected CRS (fast) as segment length
+    distance = sqrt((lead_X - X)^2 + (lead_Y - Y)^2),
+    speed = ifelse(time_diff > 0, distance / time_diff, NA_real_),
+    acceleration = (lead(speed) - speed) / time_diff,
+    # mark segments where a valid next point exists
+    has_next = !is.na(lead_X) & !is.na(lead_Y) & time_diff > 0
+  ) |>
+  ungroup()
+
+# Keep only valid numeric movement observations
+tracks_features <- tracks_features |>
+  filter(!is.na(speed) & is.finite(speed))
+```
+
+# ==========================================
+# 3. SPATIAL CONTEXT INTEGRATION
+# ==========================================
+
+```{r}
+## Efficiently compute distances via sampling per-segment
+
+# Build a table of segments (only rows that have a valid next point)
+segments <- tracks_features |>
+  mutate(segment_id = ifelse(has_next, paste0(user_id, "_", row_number()), NA_character_)) |>
+  filter(!is.na(segment_id)) |>
+  select(segment_id, user_id, datetime, X, Y, lead_X, lead_Y)
+
+# Sampling scheme: start, 3 intermediate points, end (5 points)
+tvals <- c(0, 0.25, 0.5, 0.75, 1)
+
+# Generate representative sample points for all segments
+sampled_list <- lapply(seq_len(nrow(segments)), function(i) {
+  sx <- segments$X[i]
+  sy <- segments$Y[i]
+  ex <- segments$lead_X[i]
+  ey <- segments$lead_Y[i]
+  seg_id <- segments$segment_id[i]
+  user <- segments$user_id[i]
+  data.frame(
+    segment_id = seg_id,
+    user_id = user,
+    t = tvals,
+    x = sx + tvals * (ex - sx),
+    y = sy + tvals * (ey - sy),
+    stringsAsFactors = FALSE
+  )
+})
+
+sampled_df <- do.call(rbind, sampled_list)
+rm(sampled_list)
+
+# Convert to sf points with the same CRS as the original tracks
+sampled_sf <- st_as_sf(sampled_df, coords = c("x", "y"), crs = st_crs(tracks))
+
+# Compute nearest highway and distance for sampled points
+nearest_hw_idx <- st_nearest_feature(sampled_sf, highway)
+hw_distances <- st_distance(sampled_sf, highway[nearest_hw_idx, ], by_element = TRUE)
+sampled_df$distance_to_highway <- as.numeric(hw_distances)
+
+# Compute nearest railway distance for sampled points
+nearest_rail_idx <- st_nearest_feature(sampled_sf, railway)
+rail_distances <- st_distance(sampled_sf, railway[nearest_rail_idx, ], by_element = TRUE)
+sampled_df$distance_to_railway <- as.numeric(rail_distances)
+
+# Aggregate back to segment-level by mean distance
+segment_context <- sampled_df |>
+  group_by(segment_id) |>
+  summarise(
+    distance_to_highway = mean(distance_to_highway, na.rm = TRUE),
+    distance_to_railway = mean(distance_to_railway, na.rm = TRUE)
+  ) |>
+  ungroup()
+
+# Join aggregated context back to the tracks_features (assign to the segment-start row)
+tracks_context <- tracks_features |>
+  mutate(segment_id = ifelse(has_next, paste0(user_id, "_", row_number()), NA_character_)) |>
+  left_join(segment_context, by = "segment_id")
+
+```
+
+# ==========================================
+# 4. CUSTOM FEATURE ENGINEERING
+# ==========================================
+
+```{r}
+# Feature 2: Binary indicator for immediate proximity to railway tracks (less than 50 meters)
+tracks_context$close_to_railway <- tracks_context$distance_to_railway < 50
+
+# Feature 3: Binary indicator separating major roads from minor paths and residential streets
+major_road_types <- c("motorway", "trunk", "primary", "secondary")
+# We attempt to attach the nearest highway attribute to the segment-start row (if available)
+nearest_hw_attr_idx <- st_nearest_feature(sampled_sf, highway)
+sampled_df$hw_type <- highway$highway[nearest_hw_attr_idx]
+# aggregate majority highway type per segment (mode)
+hw_mode <- sampled_df |>
+  group_by(segment_id) |>
+  summarise(highway = names(sort(table(hw_type), decreasing = TRUE))[1])
+
+tracks_context <- tracks_context |>
+  left_join(hw_mode, by = "segment_id") |>
+  mutate(is_major_road = highway %in% major_road_types)
+```
+
+# ==========================================
+# 5. DATA CLEANING & PREPARATION FOR ML
+# ==========================================
+
+```{r}
+# Handle missing values and convert categorical strings into factors
+ml_ready_data <- tracks_context |>
+  mutate(cycleway = ifelse(is.na(cycleway), FALSE, cycleway)) |>
+  mutate(
+    highway = as.factor(highway),
+    cycleway = as.factor(cycleway),
+    close_to_railway = as.factor(close_to_railway),
+    is_major_road = as.factor(is_major_road),
+    travel_mode = as.factor(travel_mode)
+  ) |>
+  st_drop_geometry() |>
+  na.omit()
+```
+
+# ==========================================
+# 6. MODEL TRAINING & EVALUATION
+# ==========================================
+
+```{r}
+# Define feature sets for comparison
+movement_features <- c("speed", "acceleration")
+context_features <- c("speed", "acceleration", "highway", "cycleway", 
+                      "distance_to_railway", "distance_to_highway", 
+                      "close_to_railway", "is_major_road")
+
+# Create data split for training (80%) and testing (20%)
+set.seed(42)
+train_indices <- createDataPartition(ml_ready_data$travel_mode, p = 0.8, list = FALSE)
+train_set <- ml_ready_data[train_indices, ]
+test_set <- ml_ready_data[-train_indices, ]
+
+# Define cross-validation parameters
+train_control <- trainControl(method = "cv", number = 5)
+
+# Train Model 1: Movement features only (Baseline)
+formula_m1 <- as.formula(paste("travel_mode ~", paste(movement_features, collapse = " + ")))
+model_movement <- train(formula_m1, data = train_set, method = "rf", trControl = train_control)
+
+# Train Model 2: Movement features combined with spatial context features
+formula_m2 <- as.formula(paste("travel_mode ~", paste(context_features, collapse = " + ")))
+model_context <- train(formula_m2, data = train_set, method = "rf", trControl = train_control)
+
+# Evaluate both models on the independent test set
+predictions_m1 <- predict(model_movement, test_set)
+predictions_m2 <- predict(model_context, test_set)
+
+confusion_matrix_m1 <- confusionMatrix(predictions_m1, test_set$travel_mode)
+confusion_matrix_m2 <- confusionMatrix(predictions_m2, test_set$travel_mode)
+
+# Print overall accuracy metrics to console for comparison
+cat("--- Baseline Model Accuracy (Movement Only) ---\n")
+print(confusion_matrix_m1$overall["Accuracy"])
+
+cat("--- Enhanced Model Accuracy (Movement + Context) ---\n")
+print(confusion_matrix_m2$overall["Accuracy"])
+```
