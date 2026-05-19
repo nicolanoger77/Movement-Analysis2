@@ -21,12 +21,12 @@ library(caret)
 # ==========================================
 
 # Load OpenStreetMap context layers
-gpkg_osm <- "data/movement-II/osm.gpkg"
+gpkg_osm <- "data/osm.gpkg"
 highway <- read_sf(gpkg_osm, "highway")
 railway <- read_sf(gpkg_osm, "railway")
 
 # Load the full trajectory dataset from previous week
-tracks <- read_sf("data/movement-I/tracks_1.gpkg", layer = "training")
+tracks <- read_sf("data/tracks_1.gpkg", layer = "training")
 ```
 
 
@@ -76,29 +76,17 @@ segments <- tracks_features |>
   filter(!is.na(segment_id)) |>
   select(segment_id, user_id, datetime, X, Y, lead_X, lead_Y)
 
-# Sampling scheme: start, 3 intermediate points, end (5 points)
-tvals <- c(0, 0.25, 0.5, 0.75, 1)
+# Sampling scheme: start, midpoint, end (3 points) — optimized for speed
+tvals <- c(0, 0.5, 1)
 
-# Generate representative sample points for all segments
-sampled_list <- lapply(seq_len(nrow(segments)), function(i) {
-  sx <- segments$X[i]
-  sy <- segments$Y[i]
-  ex <- segments$lead_X[i]
-  ey <- segments$lead_Y[i]
-  seg_id <- segments$segment_id[i]
-  user <- segments$user_id[i]
-  data.frame(
-    segment_id = seg_id,
-    user_id = user,
-    t = tvals,
-    x = sx + tvals * (ex - sx),
-    y = sy + tvals * (ey - sy),
-    stringsAsFactors = FALSE
-  )
-})
-
-sampled_df <- do.call(rbind, sampled_list)
-rm(sampled_list)
+# Generate representative sample points for all segments (vectorized, no loop)
+sampled_df <- segments |>
+  tidyr::expand_grid(t = tvals) |>
+  mutate(
+    x = X + t * (lead_X - X),
+    y = Y + t * (lead_Y - Y)
+  ) |>
+  select(segment_id, user_id, t, x, y)
 
 # Convert to sf points with the same CRS as the original tracks
 sampled_sf <- st_as_sf(sampled_df, coords = c("x", "y"), crs = st_crs(tracks))
@@ -142,13 +130,19 @@ major_road_types <- c("motorway", "trunk", "primary", "secondary")
 # We attempt to attach the nearest highway attribute to the segment-start row (if available)
 nearest_hw_attr_idx <- st_nearest_feature(sampled_sf, highway)
 sampled_df$hw_type <- highway$highway[nearest_hw_attr_idx]
-# aggregate majority highway type per segment (mode)
-hw_mode <- sampled_df |>
+sampled_df$cycleway <- highway$cycleway[nearest_hw_attr_idx]
+
+# aggregate majority highway type and cycleway presence per segment
+hw_cycleway_mode <- sampled_df |>
   group_by(segment_id) |>
-  summarise(highway = names(sort(table(hw_type), decreasing = TRUE))[1])
+  summarise(
+    highway = names(sort(table(hw_type), decreasing = TRUE))[1],
+    cycleway = as.logical(mean(cycleway, na.rm = TRUE) > 0.5)
+  ) |>
+  ungroup()
 
 tracks_context <- tracks_context |>
-  left_join(hw_mode, by = "segment_id") |>
+  left_join(hw_cycleway_mode, by = "segment_id") |>
   mutate(is_major_road = highway %in% major_road_types)
 ```
 
@@ -159,10 +153,9 @@ tracks_context <- tracks_context |>
 ```{r}
 # Handle missing values and convert categorical strings into factors
 ml_ready_data <- tracks_context |>
-  mutate(cycleway = ifelse(is.na(cycleway), FALSE, cycleway)) |>
   mutate(
     highway = as.factor(highway),
-    cycleway = as.factor(cycleway),
+    cycleway = as.factor(ifelse(is.na(cycleway), FALSE, cycleway)),
     close_to_railway = as.factor(close_to_railway),
     is_major_road = as.factor(is_major_road),
     travel_mode = as.factor(travel_mode)
