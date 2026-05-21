@@ -76,6 +76,12 @@ segments <- tracks_features |>
   filter(!is.na(segment_id)) |>
   select(segment_id, user_id, datetime, X, Y, lead_X, lead_Y)
 
+# Limit the number of segments for rendering speed while keeping the workflow intact
+set.seed(42)
+total_segments <- nrow(segments)
+segments <- segments |>
+  slice_sample(n = min(3000, total_segments))
+
 # Sampling scheme: start, midpoint, end (3 points) — optimized for speed
 tvals <- c(0, 0.5, 1)
 
@@ -181,20 +187,24 @@ train_indices <- createDataPartition(ml_ready_data$mode, p = 0.8, list = FALSE)
 train_set <- ml_ready_data[train_indices, ]
 test_set <- ml_ready_data[-train_indices, ]
 
-# Define cross-validation parameters
-train_control <- trainControl(method = "cv", number = 5)
+# Keep training fast by using a balanced sample of the training split
+sample_per_class <- ceiling(500 / n_distinct(train_set$mode))
+train_set <- train_set |>
+  group_by(mode) |>
+  slice_sample(n = min(sample_per_class, n())) |>
+  ungroup()
 
-# Train Model 1: Movement features only (Baseline)
+# Define lightweight training parameters
 formula_m1 <- as.formula(paste("mode ~", paste(movement_features, collapse = " + ")))
-model_movement <- train(formula_m1, data = train_set, method = "rpart", trControl = train_control)
-
-# Train Model 2: Movement features combined with spatial context features
 formula_m2 <- as.formula(paste("mode ~", paste(context_features, collapse = " + ")))
-model_context <- train(formula_m2, data = train_set, method = "rpart", trControl = train_control)
+
+# Train models directly with rpart to avoid caret's extra tuning overhead
+model_movement <- rpart::rpart(formula_m1, data = train_set, method = "class", control = rpart::rpart.control(cp = 0.01, maxdepth = 5))
+model_context <- rpart::rpart(formula_m2, data = train_set, method = "class", control = rpart::rpart.control(cp = 0.01, maxdepth = 5))
 
 # Evaluate both models on the independent test set
-predictions_m1 <- predict(model_movement, test_set)
-predictions_m2 <- predict(model_context, test_set)
+predictions_m1 <- predict(model_movement, test_set, type = "class")
+predictions_m2 <- predict(model_context, test_set, type = "class")
 
 confusion_matrix_m1 <- confusionMatrix(predictions_m1, test_set$mode)
 confusion_matrix_m2 <- confusionMatrix(predictions_m2, test_set$mode)
