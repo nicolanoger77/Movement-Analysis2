@@ -191,7 +191,7 @@ test_set <- ml_ready_data[-train_indices, ]
 sample_per_class <- ceiling(500 / n_distinct(train_set$mode))
 train_set <- train_set |>
   group_by(mode) |>
-  slice_sample(n = min(sample_per_class, n())) |>
+  group_modify(~ .x |> slice_sample(n = min(nrow(.x), sample_per_class))) |>
   ungroup()
 
 # Define lightweight training parameters
