@@ -186,11 +186,11 @@ train_control <- trainControl(method = "cv", number = 5)
 
 # Train Model 1: Movement features only (Baseline)
 formula_m1 <- as.formula(paste("mode ~", paste(movement_features, collapse = " + ")))
-model_movement <- train(formula_m1, data = train_set, method = "rf", trControl = train_control)
+model_movement <- train(formula_m1, data = train_set, method = "rpart", trControl = train_control)
 
 # Train Model 2: Movement features combined with spatial context features
 formula_m2 <- as.formula(paste("mode ~", paste(context_features, collapse = " + ")))
-model_context <- train(formula_m2, data = train_set, method = "rf", trControl = train_control)
+model_context <- train(formula_m2, data = train_set, method = "rpart", trControl = train_control)
 
 # Evaluate both models on the independent test set
 predictions_m1 <- predict(model_movement, test_set)
